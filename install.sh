@@ -145,7 +145,7 @@ install_monitoring_script() {
     ((CRON_START_TIME = RANDOM % 59))
 
     echo "We tune cron task to run on $CRON_START_TIME minutes of every hour"
-    echo "$CRON_START_TIME * * * * root $INSTALL_TO/$MONITORING_SCRIPT_NAME --cron" >> "$CRON_FILE"
+    echo "$CRON_START_TIME * * * * root $INSTALL_TO/$MONITORING_SCRIPT_NAME --cron >/dev/null 2>&1" >> "$CRON_FILE"
     chmod 644 -- "$CRON_FILE"
 }
 
@@ -162,25 +162,26 @@ start_smartd_tests() {
     # creating config and restart service
     case $DISTRIB in
         debian)
-	if [[ ! -e /etc/smartd.conf.dist ]]; then # TODO why?
-        mv /etc/smartd.conf /etc/smartd.conf.dist
-    	fi
-    	echo "$SMARTD_COMMAND" > /etc/smartd.conf
+        if [[ ! -e /etc/smartd.conf.dist ]]; then # TODO why?
+            mv /etc/smartd.conf /etc/smartd.conf.dist
+        fi
+        echo "$SMARTD_COMMAND" > /etc/smartd.conf
         enable_smartd_start_debian
         $SMARTD_REST_DEBIAN
         ;;
 
         centos)
-	if [[ ! -e /etc/smartd.conf.dist ]]; then # TODO why?
-        mv /etc/smartd.conf /etc/smartd.conf.dist
+        if [[ ! -e /etc/smartd.conf.dist ]]; then # TODO why?
+            mv /etc/smartd.conf /etc/smartd.conf.dist
         fi
+        /sbin/chkconfig smartd on
         echo "$SMARTD_COMMAND" > /etc/smartd.conf
         $SMARTD_REST_CENTOS
         ;;
 
-	centos7)
-	if [[ ! -e /etc/smartmontools/smartd.conf.dist ]]; then # TODO why?
-        mv /etc/smartmontools/smartd.conf /etc/smartmontools/smartd.conf.dist
+        centos7)
+        if [[ ! -e /etc/smartmontools/smartd.conf.dist ]]; then # TODO why?
+            mv /etc/smartmontools/smartd.conf /etc/smartmontools/smartd.conf.dist
         fi
         echo "$SMARTD_COMMAND" > /etc/smartmontools/smartd.conf
         $SMARTD_REST_CENTOS7
