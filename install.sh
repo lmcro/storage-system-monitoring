@@ -1,255 +1,798 @@
 #!/bin/bash
 #
-# Это скрипт установщик для системы мониторинга дисковой подсистемы серверов компании FastVPS Eesti OU
-# Если у Вас есть вопросы по работе данной системы, рекомендуем обратиться по адресам:
+# That is installation script for storage system monitoring by FASTVPS Eesti OU
+# If you have any questions about that system, please contact us:
 # - https://github.com/FastVPSEestiOu/storage-system-monitoring
-# - https://bill2fast.com (через тикет систему)
-#
+# - https://bill2fast.com (via ticket system)
 
-# Данные пакеты обязательны к установке, так как используются скриптом мониторинга
-DEBIAN_DEPS=(wget libstdc++5 parted smartmontools liblwp-useragent-determined-perl libnet-https-any-perl libcrypt-ssleay-perl libjson-perl)
-CENTOS_DEPS=(wget libstdc++ parted smartmontools perl-Crypt-SSLeay perl-libwww-perl perl-JSON)
-CENTOS7_DEPS=(wget libstdc++ parted smartmontools perl-Crypt-SSLeay perl-libwww-perl perl-JSON perl-LWP-Protocol-https)
+set -u
 
-# init.d script для smartd
-SMARTD_REST_DEBIAN='/etc/init.d/smartmontools restart'
-SMARTD_REST_CENTOS='/etc/init.d/smartd restart'
-SMARTD_REST_CENTOS7='/bin/systemctl restart smartd.service'
+# Disable interactive mode when configuring packages
+export DEBIAN_FRONTEND='noninteractive'
 
-GITHUB_FASTVPS_URL='https://raw.github.com/FastVPSEestiOu/storage-system-monitoring'
+# Setting text colors
+TXT_GRN='\e[0;32m'
+TXT_RED='\e[0;31m'
+TXT_YLW='\e[0;33m'
+TXT_RST='\e[0m'
 
-# Diag utilities repo
-DIAG_UTILITIES_REPO='https://raw.github.com/FastVPSEestiOu/storage-system-monitoring/master/raid_monitoring_tools'
+# Set variable for pid
+PID=$$
 
-MONITORING_SCRIPT_NAME='storage_system_fastvps_monitoring.pl'
+# Path for binaries
+BIN_PATH='/usr/local/bin'
 
-# Monitoring script URL
-MONITORING_SCRIPT_URL="$GITHUB_FASTVPS_URL/master/$MONITORING_SCRIPT_NAME"
+# Path of our repo, used for downloads
+REPO_PATH='https://raw.githubusercontent.com/FastVPSEestiOu/storage-system-monitoring/master'
 
-# Monitoring CRON file
+# Name of our script
+SCRIPT_NAME='storage_system_fastvps_monitoring.pl'
+
+# Path of our cron task
 CRON_FILE='/etc/cron.d/storage-system-monitoring-fastvps'
 
-# Installation path
-INSTALL_TO='/usr/local/bin'
+# Static header for our cron task 
+CRON_HEADER='# FastVPS disk monitoring tool
+# https://github.com/FastVPSEestiOu/storage-system-monitoring
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
-# smartd config command to run repiodic tests (short/long)
-SMARTD_COMMAND="# smartd.conf by FastVPS
-# backup version of distrib file saved to /etc/smartd.conf.dist
+# Suffix we add to moved smartd.conf
+SMARTD_SUFFIX="fastvps_backup.${PID}"
 
-# Discover disks and run short tests every day at 02:00 and long tests every sunday at 03:00
-DEVICESCAN -d removable -n standby -s (S/../.././02|L/../../7/03)"
+# Static header for our smartd.conf
+SMARTD_HEADER="# smartd.conf by FastVPS
+# backup version of distrib file saved to /etc/smartd.conf.$SMARTD_SUFFIX
+# Discover disks and run short tests every day at 02:00 and long tests every sunday at 03:00"
 
-ARCH=
-DISTRIB=
+# Stable smartctl version (SVN revision)
+SMARTCTL_STABLE_VERSION='6.6'
+SMARTCTL_STABLE_REVISION='4318'
 
-check_n_install_debian_deps() {
-    echo "Installing Debian dependencies: ${DEBIAN_DEPS[*]} ..."
-    apt-get update
-    if ! apt-get install -y "${DEBIAN_DEPS[@]}"; then
-        echo 'Something went wrong while installing dependencies!' >&2
-    fi
-    echo 'Finished installation of debian dependencies.'
+# Smartd config path
+declare -A SMARTD_CONF_FILE
+SMARTD_CONF_FILE["deb"]='/etc/smartd.conf'
+SMARTD_CONF_FILE["deb_old"]='/etc/smartd.conf'
+SMARTD_CONF_FILE["rpm_old"]='/etc/smartd.conf'
+SMARTD_CONF_FILE["rpm_new"]='/etc/smartmontools/smartd.conf'
+
+OS=''
+ARCH=''
+OS_TYPE=''
+CRON_MINUTES=''
+RAID_TYPE=''
+
+# Dependencies
+declare -A PKG_DEPS
+PKG_DEPS["deb"]='wget libstdc++5 smartmontools liblwp-useragent-determined-perl libnet-https-any-perl libcrypt-ssleay-perl libjson-perl'
+PKG_DEPS["deb_old"]='wget libstdc++5 smartmontools liblwp-useragent-determined-perl libnet-https-any-perl libcrypt-ssleay-perl libjson-perl'
+PKG_DEPS["rpm_old"]='wget libstdc++ smartmontools perl-Crypt-SSLeay perl-libwww-perl perl-JSON'
+PKG_DEPS["rpm_new"]='wget libstdc++ smartmontools perl-Crypt-SSLeay perl-libwww-perl perl-JSON perl-LWP-Protocol-https'
+
+declare -A PKG_INSTALL
+PKG_INSTALL["deb"]='apt-get update -qq && apt-get install -qq'
+PKG_INSTALL["deb_old"]='apt-get update -o Acquire::Check-Valid-Until=false -qq && apt-get install -qq --allow-unauthenticated'
+PKG_INSTALL["rpm_old"]='yum install -q -y'
+PKG_INSTALL["rpm_new"]='yum install -q -y'
+
+# List of packages which we do NOT want to update, in form of regex
+declare -A PKG_UNSAFE
+PKG_UNSAFE["deb"]='Inst libc6|Inst apache2|Inst php'
+PKG_UNSAFE["deb_old"]='Inst libc6|Inst apache2|Inst php'
+PKG_UNSAFE["rpm_old"]='^ glibc|^ httpd|^ php'
+PKG_UNSAFE["rpm_new"]='^ glibc|^ httpd|^ php'
+
+# And command for it
+declare -A PKG_INSTALL_TEST
+PKG_INSTALL_TEST["deb"]='apt-get update && apt-get install -s'
+PKG_INSTALL_TEST["deb_old"]='apt-get update -o Acquire::Check-Valid-Until=false -qq && apt-get install -s'
+PKG_INSTALL_TEST["rpm_old"]='yum install --assumeno'
+PKG_INSTALL_TEST["rpm_new"]='yum install --assumeno'
+
+
+# Some fancy echoing
+_echo_OK()
+{
+    echo -e " -> ${TXT_GRN}OK${TXT_RST}"
 }
 
-check_n_install_centos_deps() {
-    echo "Installing CentOS dependencies: ${CENTOS_DEPS[*]} ..."
-    if ! yum install -y "${CENTOS_DEPS[@]}"; then
-        echo 'Something went wrong while installing dependencies.' >&2
-    fi
-    echo 'Finished installation of CentOS dependencies.'
+_echo_FAIL()
+{
+    echo -e " -> ${TXT_RED}FAIL${TXT_RST}"
 }
 
-check_n_install_centos7_deps() {
-    echo "Installing CentOS 7 dependencies: ${CENTOS_DEPS[*]} ..."
-    if ! yum install -y "${CENTOS7_DEPS[@]}"; then
-        echo 'Something went wrong while installing dependencies.' >&2
-    fi
-    echo 'Finished installation of CentOS 7 dependencies.'
+_echo_tabbed()
+{
+    local message=$1
+    
+    echo -e " -> $message"
 }
 
-# Проверяем наличие аппаратный RAID контроллеров и в случае наличия устанавливаем ПО для их мониторинга
-check_n_install_diag_tools() {
-    # utilities have suffix of ARCH, i.e. arcconf32 or megacli64
-    ADAPTEC_UTILITY=arcconf
-    # LSI_UTILITY=megacli
-
-    lsi_raid=0
-    adaptec_raid=0
-
-    # флаг -m не используется, так как он не поддерживается в версии parted на CentOS 5
-    parted_diag=$(parted -ls)
-
-    echo 'Checking hardware for LSI or Adaptec RAID controllers...'
-    if grep -i 'adaptec' <<< "$parted_diag"; then
-        echo 'Found Adaptec raid'
-        adaptec_raid=1
+_echo_result()
+{
+    local result=$*
+    if [[ "$result" -eq 0 ]]; then
+        _echo_OK
+    else
+        _echo_FAIL
+        exit 1
     fi
-    if grep -Ei 'lsi|perc' <<< "$parted_diag"; then
-        echo 'Found LSI raid'
-        lsi_raid=1
-    fi
+}
 
-    if (( adaptec_raid == 0 && lsi_raid == 0 )); then
-        echo 'Hardware raid not found'
-        return
-    fi
-
-    echo
-
-    if (( adaptec_raid == 1 )); then
-        echo 'Installing diag utilities for Adaptec raid...'
-        wget --no-check-certificate "$DIAG_UTILITIES_REPO/arcconf$ARCH" -O "$INSTALL_TO/$ADAPTEC_UTILITY"
-        chmod +x -- "$INSTALL_TO/$ADAPTEC_UTILITY"
-        echo 'Finished installation of diag utilities for Apactec raid'
-    fi
-
-    echo
-
-    if (( lsi_raid == 1 )); then
-        echo 'Installing diag utilities for LSI MegaRaid...'
-
-        # Dependencies installation
-        case $DISTRIB in
-            debian)
-                wget --no-check-certificate "$DIAG_UTILITIES_REPO/megacli.deb" -O /tmp/megacli.deb
-                dpkg -i /tmp/megacli.deb
-                rm -f /tmp/megacli.deb
-            ;;
-            centos)
-                yum install -y "$DIAG_UTILITIES_REPO/megacli.rpm"
-            ;;
-            *)
-                echo 'Cannot install LSI tools for you distribution'
+# Detect OS
+_detect_os()
+{
+    local issue_file='/etc/issue'
+    local os_release_file='/etc/os-release'
+    local redhat_release_file='/etc/redhat-release'
+    local os=''
+    local name=''
+    local version=''
+    # First of all, trying os-relese file
+    if [ -f $os_release_file ]; then
+        name=$(grep '^NAME=' $os_release_file | awk -F'[" ]' '{print $2}')
+        version=$(grep '^VERSION_ID=' $os_release_file | awk -F'[". ]' '{print $2}')
+        os="${name}${version}"
+    else
+        # If not, trying redhat-release file (mainly because of bitrix-env)
+        if [ -f $redhat_release_file ]; then
+            os=$(head -1 /etc/redhat-release | sed -re 's/([A-Za-z]+)[^0-9]*([0-9]+).*$/\1\2/')
+        else
+            # Else, trying issue file
+            if [ -f $issue_file ]; then
+                os=$(head -1 $issue_file | sed -re 's/([A-Za-z]+)[^0-9]*([0-9]+).*$/\1\2/')
+            else
+                # If none of that files worked, exit
+                echo -e "${TXT_RED}Cannot detect OS. Exiting now"'!'"${TXT_RST}"
                 exit 1
-            ;;
-        esac
-
-        echo 'Finished installation of diag utilities for LSI raid'
+            fi
+        fi
     fi
+    OS=$os
 }
 
-install_monitoring_script() {
-    # Remove old monitoring run script
-    rm -f '/etc/cron.hourly/storage-system-monitoring-fastvps'
+# Detect architecture
+_detect_arch()
+{
+    local arch=''
+    local uname=''
 
-    echo "Installing monitoring.pl into $INSTALL_TO..."
-    wget --no-check-certificate "$MONITORING_SCRIPT_URL" -O "$INSTALL_TO/$MONITORING_SCRIPT_NAME"
-    chmod +x -- "$INSTALL_TO/$MONITORING_SCRIPT_NAME"
-
-    echo "Installing CRON task to $CRON_FILE"
-    echo '# FastVPS disk monitoring tool' > "$CRON_FILE"
-    echo '# https://github.com/FastVPSEestiOu/storage-system-monitoring' >> "$CRON_FILE"
-
-    # We should randomize run time to prevent ddos attacks to our gates
-    # Limit random numbers by 59 minutes
-    ((CRON_START_TIME = RANDOM % 59))
-
-    echo "We tune cron task to run on $CRON_START_TIME minutes of every hour"
-    echo "$CRON_START_TIME * * * * root $INSTALL_TO/$MONITORING_SCRIPT_NAME --cron >/dev/null 2>&1" >> "$CRON_FILE"
-    chmod 644 -- "$CRON_FILE"
-}
-
-# We should enable smartd startup explicitly because it is switched off by default
-enable_smartd_start_debian() {
-    if ! grep -E '^start_smartd=yes' '/etc/default/smartmontools' > /dev/null; then
-        echo 'start_smartd=yes' >> '/etc/default/smartmontools'
+    uname=$(uname -m)
+    if [[ $uname == 'x86_64' ]]; then
+        arch=64
+    else
+        arch=32
     fi
+
+    ARCH=$arch
 }
 
-start_smartd_tests() {
-    echo -n 'Creating config for smartd... '
+# Select OS type based on OS
+_select_os_type()
+{
+    local os=$1
+    local os_type=''
 
-    # creating config and restart service
-    case $DISTRIB in
-        debian)
-        if [[ ! -e /etc/smartd.conf.dist ]]; then # TODO why?
-            mv /etc/smartd.conf /etc/smartd.conf.dist
-        fi
-        echo "$SMARTD_COMMAND" > /etc/smartd.conf
-        enable_smartd_start_debian
-        $SMARTD_REST_DEBIAN
+    case $os in
+        Debian[6-7] )
+            os_type='deb_old'
         ;;
-
-        centos)
-        if [[ ! -e /etc/smartd.conf.dist ]]; then # TODO why?
-            mv /etc/smartd.conf /etc/smartd.conf.dist
-        fi
-        /sbin/chkconfig smartd on
-        echo "$SMARTD_COMMAND" > /etc/smartd.conf
-        $SMARTD_REST_CENTOS
+        Debian[8-9]|Debian10|Ubuntu* )
+            os_type='deb'
         ;;
-
-        centos7)
-        if [[ ! -e /etc/smartmontools/smartd.conf.dist ]]; then # TODO why?
-            mv /etc/smartmontools/smartd.conf /etc/smartmontools/smartd.conf.dist
-        fi
-        echo "$SMARTD_COMMAND" > /etc/smartmontools/smartd.conf
-        $SMARTD_REST_CENTOS7
+        CentOS6 )
+            os_type='rpm_old'
+        ;;
+        CentOS7 )
+            os_type='rpm_new'
+        ;;
+        * )
+            echo "We can do nothing on $os. Exiting."
+            _echo_FAIL
+            exit 1
         ;;
     esac
 
-    echo 'done.'
+    OS_TYPE=$os_type
+}
 
-    if (( $? != 0 )); then
-        echo 'smartd failed to start. This may be caused by absence of disks SMART able to monitor.' >&2
-        tail /var/log/messages
+# Check and install needed software
+_install_deps()
+{
+    local os_type=$1
+    local pkgs_to_install=()
+    local unsafe_pkgs=()
+
+    # Check if we have packages needed
+    local pkg=''
+    local result=''
+
+    for pkg in ${PKG_DEPS[$os_type]}; do
+        if ! _check_pkg "$os_type" "$pkg" ; then
+            pkgs_to_install+=("$pkg")
+        fi
+    done
+
+    if [[ ${#pkgs_to_install[@]} -eq 0 ]]; then
+        _echo_tabbed "We have everything we need."
+        return 0
+    else
+        _echo_tabbed "Installing: ${TXT_YLW}${pkgs_to_install[*]}${TXT_RST} ..."
+
+        # Check if we are going to break something
+	    mapfile -t < <( eval "${PKG_INSTALL_TEST[$os_type]}" "${pkgs_to_install[@]}" ) result
+        for (( i=0; i<${#result[@]}; i++ )); do
+            if [[ "${result[i]}" =~ ${PKG_UNSAFE[$os_type]} ]]; then
+		        unsafe_pkgs+=("${result[i]}")
+            fi
+        done
+
+        if [[ ${#unsafe_pkgs[@]} -gt 0 ]]; then
+            echo "We are going to update something we do not want to:"
+            for (( i=0; i<${#unsafe_pkgs[@]}; i++ )); do
+                echo "${unsafe_pkgs[i]}";
+            done
+            echo -e "\nYou can check it yourself with command:\n${PKG_INSTALL_TEST[$os_type]}" "${pkgs_to_install[@]}"
+            return 1
+        fi
+
+        # Catch error in variable
+        if IFS=$'\n' result=( $(eval "${PKG_INSTALL[$os_type]}" "${pkgs_to_install[@]}" 2>&1) ); then
+            return 0
+
+        # And output it, if we had nonzero exit code
+        else
+            echo
+            for (( i=0; i<${#result[@]}; i++ )); do
+                echo "${result[i]}";
+            done
+            return 1
+        fi
     fi
 }
 
-#
-# Start installation procedure
-#
+# Check package
+_check_pkg()
+{
+    local os_type=$1
+    local pkg=$2
 
-ARCH=32
-if uname -a | grep -E 'amd64|x86_64' > /dev/null; then # XXX perhaps 'uname -m' is better?
-    ARCH=64
-fi
+    case $os_type in
+        deb* )
+            if dpkg-query -W -f='\${Status}' "$pkg" 2>&1 | grep -qE '^(\$install ok installed)+$'; then
+                return 0
+            else
+                return 1
+            fi
+        ;;
+        rpm* )
+            if rpm --quiet -q "$pkg"; then
+                return 0
+            else
+                return 1
+            fi
+        ;;
+        * )
+            _echo_tabbed "We can do nothing on $os_type. Exiting."
+            exit 1
+        ;;
+    esac
+}
 
-if grep -Ei 'Debian|Ubuntu|Proxmox' < /etc/issue > /dev/null; then
-    DISTRIB=debian
-elif grep -Ei 'CentOS|Fedora|Parallels|Citrix XenServer' < /etc/issue > /dev/null; then
-    DISTRIB=centos
-elif [ -f /etc/centos-release ] && grep -Ei 'CentOS\ Linux\ release\ 7' < /etc/centos-release > /dev/null; then
-    DISTRIB=centos7
-fi
+# Function to download with check
+_dl_and_check()
+{
+    local remote_path=$1
+    local local_path=$2
+    local os=$OS
+    local result=()
+    local wget_param=()
 
-echo "We are working on $DISTRIB $ARCH"
+    # Adding --no-check-certificate on old OS
+    case $os in
+        Debian6 )
+            wget_param=(--no-check-certificate --verbose)
+        ;;
+        * )
+            wget_param=(--verbose)
+        ;;
+    esac
 
-# Dependencies installation
-case $DISTRIB in
-    debian)
-    check_n_install_debian_deps
-    ;;
+    # Clean target path before download
+    if [[ -x "$local_path" ]]; then
+        rm -f "$local_path";
+    fi
 
-    centos)
-    check_n_install_centos_deps
-    ;;
+    # Catch error in variable
+    if IFS=$'\n' result=( $(wget "${wget_param[@]}" "$remote_path" --output-document="$local_path" 2>&1) ); then
+        return 0
 
-    centos7)
-    check_n_install_centos7_deps
-    ;;
+    # And output it, if we had nonzero exit code
+    else
+        echo
+        for (( i=0; i<${#result[@]}; i++ )); do
+            echo "${result[i]}";
+        done
+        return 1
+    fi
+}
 
-    *)
-    echo 'Cannot determine OS. Exiting...'
-    exit 1
-    ;;
-esac
+# Install RAID tools if needed
+_install_raid_tools()
+{
+    local bin_path=$1
+    local repo_path=$2
+    local arch=$3
 
-# Diagnostic tools installation
-check_n_install_diag_tools
+    local util_path=''
+    local dl_path=''
+    local raid_type=''
 
-# Monitoring script installation
-install_monitoring_script
+    # Detect RAID
+    local sys_block_check=''
+    sys_block_check=$(cat /sys/block/*/device/vendor /sys/block/*/device/model 2>/dev/null | grep -oEm1 'Adaptec|LSI|PERC|ASR8405')
 
-# Periodic smartd tests
-start_smartd_tests
+    # Select utility to install
+    case $sys_block_check in
+        # arcconf for Adaptec
+        ASR8405 )
+            raid_type='adaptec'
+            util_path="${bin_path}/arcconf"
 
-echo 'Send data to FastVPS...'
-if "$INSTALL_TO/$MONITORING_SCRIPT_NAME" --cron; then
-    echo 'Data sent successfully'
-else
-    echo 'Cannot run script in --cron mode'
-fi
+            _echo_tabbed "Found RAID: ${TXT_YLW}${sys_block_check}${TXT_RST}"
 
-echo 'Checking disk system...'
-"$INSTALL_TO/$MONITORING_SCRIPT_NAME" --detect
+            dl_path="${repo_path}/raid_monitoring_tools/arcconf_new"
+        ;;
+        Adaptec )
+            raid_type='adaptec'
+            util_path="${bin_path}/arcconf"
+
+            local adaptec_version=''
+            adaptec_version=$(lspci -m | awk -F\"  '/Adaptec/ {print $(NF-1)}')
+
+            _echo_tabbed "Found RAID: ${TXT_YLW}${sys_block_check} ${adaptec_version}${TXT_RST}"
+
+            # Select arcconf version dpending on controller version
+            case $adaptec_version in
+                # Old Adaptec controller (2xxx-5xxx) - need to use old arcconf
+                *[2-5][0-9][0-9][0-9] )
+                    dl_path="${repo_path}/raid_monitoring_tools/arcconf${arch}_old"
+                ;;
+                # Newer Adaptec controller (6xxx-8xxx) - new version of arcconf
+                *[6-8][0-9][0-9][0-9] )
+                    dl_path="${repo_path}/raid_monitoring_tools/arcconf_new"
+                ;;
+                # Otherwise exit
+                * )
+                    echo "We don't know, what arcconf version is needed."
+                    return 1
+                ;;
+            esac
+
+        ;;
+
+        # megacli for LSI (PERC is LSI controller on DELL)
+        LSI|PERC )
+            raid_type='lsi'
+            _echo_tabbed "Found RAID: ${TXT_YLW}${sys_block_check}${TXT_RST}"
+            util_path="${bin_path}/megacli"
+            dl_path="${repo_path}/raid_monitoring_tools/megacli${arch}"
+        ;;
+
+        # Nothing if none RAID found
+        '' )
+            raid_type='soft'
+            _echo_tabbed "No HW RAID."
+        ;;
+
+        # Fallback that should never be reached
+        * )
+            _echo_tabbed "Unknown RAID type: ${TXT_YLW}${sys_block_check}${TXT_RST}. Exiting."
+            return 1
+        ;;
+    esac
+
+
+    # Set raid type for smartd
+    RAID_TYPE="$raid_type"
+
+    # Download selected utility
+    case $raid_type in
+        soft )
+            return 0
+        ;;
+        adaptec|lsi )
+            if _dl_and_check "$dl_path" "$util_path"; then
+                chmod +x "$util_path"
+                _echo_tabbed "Installed ${TXT_YLW}${util_path}${TXT_RST}"
+                RAID_TYPE="$raid_type"
+                return 0
+            else
+                return 1
+            fi
+        ;;
+        # Fallback that should never be reached
+        * )
+            _echo_tabbed "Unknown RAID type: ${TXT_YLW}${raid_type}${TXT_RST}. Exiting."
+            return 1
+        ;;
+    esac
+}
+
+# Install new smartctl binary, if we have too old one
+_install_smartctl()
+{
+    local bin_path=$1
+    local repo_path=$2
+    local arch=$3
+    local smartctl_stable_version=$4
+    local smartctl_stable_revision=$5
+
+    local smartctl_current_version=''
+    local smartctl_current_revision=''
+    local version_comp_result=''
+
+    local util_path="${bin_path}/smartctl"
+    local dl_path="${repo_path}/raid_monitoring_tools/smartctl${arch}"
+
+    smartctl_current_version=$(smartctl --version | awk '/^smartmontools release/ {print $3}')
+    smartctl_current_revision=$(smartctl --version | awk '/^smartmontools SVN rev/ {print $4}')
+
+
+    # If current version is lower then stable, download a new one
+
+    # We'll get exit code 2 if current version is lower than stable version
+    _version_copmare "$smartctl_current_version" "$smartctl_stable_version"
+    version_comp_result=$?
+    
+    if [[ "$version_comp_result" -eq "2" ]] || [[ "$smartctl_current_revision" -lt "$smartctl_stable_revision" ]]; then
+        if _dl_and_check "$dl_path" "$util_path"; then
+            chmod +x "$util_path"
+            _echo_tabbed "Installed ${TXT_YLW}${util_path}${TXT_RST}"
+            return 0
+        else
+            return 1
+        fi
+    else
+        _echo_tabbed "We have smartctl version ${TXT_YLW}${smartctl_current_version}${TXT_RST} (rev. ${TXT_YLW}${smartctl_current_revision}${TXT_RST}) here."
+        return 0
+    fi
+}
+
+# Function to compare dotted versions
+_version_copmare()
+{
+    # Compares two versions
+    # Returns:
+    #   0 -> first = second
+    #   1 -> first > second
+    #   2 -> first < second
+
+    local first_string=$1
+    local second_string=$2
+
+    local first_array=()
+    local second_array=()
+
+    # Split versions into arrays
+    IFS='.' read -ra first_array <<< "$first_string"
+    IFS='.' read -ra second_array <<< "$second_string"
+
+    # Fill empty fields in first array with zeros
+    for ((i=${#first_array[@]}; i<${#second_array[@]}; i++)); do
+        first_array[$i]=0
+    done
+
+    for ((i=0; i<${#first_array[@]}; i++)); do
+        # Fill empty fields in second array with zeros
+        if [[ -z ${second_array[$i]} ]]; then
+            second_array[$i]=0
+        fi
+
+        # "10#" forces decimal numbers interpretation
+        if ((10#${first_array[$i]} > 10#${second_array[$i]})); then
+            return 1
+        fi
+        if ((10#${first_array[$i]} < 10#${second_array[$i]})); then
+            return 2
+        fi
+    done
+
+    return 0
+}
+
+# Install monitoring script
+_install_script()
+{
+    local bin_path=$1
+    local repo_path=$2
+    local script_name=$3
+    local cron_file=$4
+    local cron_minutes=$5
+    local cron_header=$6
+
+    local script_local="${bin_path}/${script_name}"
+    local script_remote="${repo_path}/${script_name}"
+
+    if _dl_and_check "$script_remote" "$script_local"; then
+        chmod +x -- "$script_local"
+        _echo_tabbed "Installed ${TXT_YLW}${script_local}${TXT_RST}"
+    else
+        return 1
+    fi
+
+    if _set_cron "$cron_file" "$script_local" "$cron_minutes" "$cron_header"; then
+        _echo_tabbed "Installed ${TXT_YLW}${cron_file}${TXT_RST}"
+        return 0
+    else
+        return 1
+    fi
+}
+
+
+# Add cron task for script
+_set_cron()
+{
+    local cron_file=$1
+    local script_local=$2
+    local cron_minutes=$3
+    local cron_header=$4
+
+    local cron_text=''
+
+    local cron_line="$cron_minutes * * * * root $script_local --cron >/dev/null 2>&1"
+
+    read -r -d '' cron_text <<EOF
+$cron_header
+$cron_line
+EOF
+
+    echo "$cron_text" > "$cron_file"
+    chmod 644 -- "$cron_file"
+}
+
+
+# Configure SMARTD
+_set_smartd()
+{
+    local raid_type=$1
+    local smartd_header=$2
+    local os_type=$3
+    local smartd_suffix=$4
+
+    local smartd_conf_file=${SMARTD_CONF_FILE[$os_type]}
+    local smartd_conf_backup=${smartd_conf_file}.${smartd_suffix}
+
+    local smartd_conf=''
+    local drive=''
+    local drives=()
+    local lines=()
+
+    # Select smartd.conf for our RAID type
+    case $raid_type in
+        soft )
+            lines+=('DEVICESCAN -d removable -n standby -s (S/../.././02|L/../../7/03)')
+        ;;
+        adaptec )
+            # Try to load sg module if it is not loaded for some reason
+            if [[ ! -c /dev/sg0 ]]; then
+                # Catch error in variable
+                if IFS=$'\n' result=( $(modprobe sg 2>&1) ); then
+                    _echo_tabbed "Loaded ${TXT_YLW}sg${TXT_RST} module."
+
+                # And output it, if we had nonzero exit code
+                else
+                    echo
+                    for (( i=0; i<${#result[@]}; i++ )); do
+                        echo "${result[i]}";
+                    done
+                    _echo_tabbed "Failed to load ${TXT_YLW}sg${TXT_RST} module. We need it to work with Adaptec controller."
+                    return 1
+                fi
+            fi
+
+            # Get drives to check
+            local sgx=''
+            for sgx in /dev/sg?; do
+                if smartctl -q silent -i "$sgx"; then
+                    drives+=("$sgx")
+                fi
+            done
+
+            if [[ ${#drives[@]} -eq 0 ]]; then
+                _echo_tabbed "Failed to get ${TXT_YLW}/dev/sg?${TXT_RST} drives for Adaptec controller. We have tried ${TXT_YLW}modprobe sg${TXT_RST} but without success. Check it and proceed manually."
+                return 1
+            fi
+
+            # Form smartd rules
+            for drive in "${drives[@]}"; do
+                lines+=("$drive -n standby -s (S/../.././02|L/../../7/03)")
+            done
+        ;;
+        lsi )
+            # Get drives to check
+            mapfile -t < <( megacli -pdlist -a0| awk '/Device Id/ {print $NF}' ) drives
+
+            if [[ ${#drives[@]} -eq 0 ]]; then
+                _echo_tabbed "Failed to get drives for LSI controller. Try to call ${TXT_YLW}megacli -pdlist -a0${TXT_RST} and check the output."
+                return 1
+            fi
+
+            # Form smartd rules
+            for drive in "${drives[@]}"; do
+                lines+=("/dev/sda -d megaraid,${drive} -n standby -s (S/../.././02|L/../../7/03)")
+            done
+        ;;
+        * )
+            _echo_tabbed "Unknown RAID type: ${TXT_YLW}${raid_type}${TXT_RST}. Exiting."
+            return 1
+        ;;
+    esac
+
+    IFS=$'\n' read -r -d '' smartd_conf <<EOF
+$smartd_header
+${lines[*]}
+EOF
+
+    if mv "$smartd_conf_file" "$smartd_conf_backup"; then 
+        _echo_tabbed "Moved ${TXT_YLW}${smartd_conf_file}${TXT_RST} to ${TXT_YLW}${smartd_conf_backup}${TXT_RST}"
+    else
+        return 1
+    fi
+    
+    if echo "$smartd_conf" > "$smartd_conf_file"; then
+        _echo_tabbed "Filled ${TXT_YLW}${smartd_conf_file}${TXT_RST}"
+        return 0
+    else
+        return 1
+    fi
+}
+
+
+# Restart smartd to enable config
+_restart_smartd()
+{
+    local os=$1
+    local restart_cmd=''
+
+    case $os in
+        # systemctl on new OS
+        Debian[8-9]|Debian10|CentOS7|Ubuntu1[678] )
+            restart_cmd='systemctl restart smartd.service'
+        ;;
+        # /etc/init.d/ on sysv|upstart OS
+        CentOS6 )
+            restart_cmd='/etc/init.d/smartd restart'
+        ## On Debian 7 we should always have /etc/init.d/smartmontools while /etc/init.d/smartd can be removed when using backports
+        ;;
+        Debian[6-7]|Ubuntu12|Ubuntu14 )
+            # Hack for Debain 6-7
+            sed -i -e 's/^#start_smartd/start_smartd/' /etc/default/smartmontools
+            restart_cmd='/etc/init.d/smartmontools restart'
+        ;;
+        * )
+            _echo_tabbed "Don't know how to restart smartd on that OS: ${TXT_YLW}${os}${TXT_RST}"
+            return 1
+        ;;
+    esac
+
+    # Catch error in variable
+    if IFS=$'\n' result=( $(eval "$restart_cmd" 2>&1) ); then
+        _echo_tabbed "Smartd started."
+        return 0
+
+    # And output it, if we had nonzero exit code
+    else
+        echo
+        for (( i=0; i<${#result[@]}; i++ )); do
+            echo "${result[i]}";
+        done
+        return 1
+    fi
+
+}
+
+# Enable autostart of smartd
+_enable_smartd_autostart()
+{
+    local os=$1
+    local enable_cmd=''
+
+    case $os in
+        # systemctl on new OS
+        Debian[8-9]|Debian10|CentOS7|Ubuntu1[678] )
+            enable_cmd='systemctl enable smartd.service'
+        ;;
+        # chkconfig on CentOS 6
+        CentOS6 )
+            enable_cmd='chkconfig smartd on'
+        ;;
+        # update-rc.d on sysv/upstart deb-based OS
+        Debian[6-7]|Ubuntu12|Ubuntu14 )
+            enable_cmd='update-rc.d smartmontools defaults'
+        ;;
+        * )
+            _echo_tabbed "Don't know how to enable smartd autostart on that OS: ${TXT_YLW}${os}${TXT_RST}"
+            return 1
+        ;;
+    esac
+
+    # Catch error in variable
+    if IFS=$'\n' result=( $(eval "$enable_cmd" 2>&1) ); then
+        _echo_tabbed "Smartd autostart enabled."
+        return 0
+
+    # And output it, if we had nonzero exit code
+    else
+        echo
+        for (( i=0; i<${#result[@]}; i++ )); do
+            echo "${result[i]}";
+        done
+        return 1
+    fi
+}
+
+# Run monitoring script
+_run_script()
+{
+    local bin_path=$1
+    local script_name=$2
+    local mode=$3
+
+    if "${bin_path}/${script_name}" --"$mode"; then
+        return 0
+    else
+        _echo_tabbed "Cannot run script in --$mode mode"
+        return 1
+    fi
+}
+
+
+# Actual installation
+
+# Detect OS and arch
+_detect_os
+_detect_arch
+echo -e "OS: ${TXT_YLW}${OS} x${ARCH}${TXT_RST}"
+
+# Set OS type
+_select_os_type "$OS"
+
+# We should randomize run time to prevent ddos attacks to our gates
+# Limit random numbers by 59 minutes
+((CRON_MINUTES = RANDOM % 59))
+
+echo -e "Checking dependencies..."
+_install_deps "$OS_TYPE"
+_echo_result $?
+
+echo -e "Checking for hardware RAID..."
+_install_raid_tools "$BIN_PATH" "$REPO_PATH" "$ARCH"
+_echo_result $?
+
+echo -e "Installing new smartctl if needed..."
+_install_smartctl "$BIN_PATH" "$REPO_PATH" "$ARCH" "$SMARTCTL_STABLE_VERSION" "$SMARTCTL_STABLE_REVISION"
+_echo_result $?
+
+echo -e "Installing monitoring script..."
+_install_script "$BIN_PATH" "$REPO_PATH" "$SCRIPT_NAME" "$CRON_FILE" "$CRON_MINUTES" "$CRON_HEADER"
+_echo_result $?
+
+echo -e "Setting smartd..."
+_set_smartd "$RAID_TYPE" "$SMARTD_HEADER" "$OS_TYPE" "$SMARTD_SUFFIX"
+_echo_result $?
+
+echo -e "Starting smartd..."
+_restart_smartd "$OS"
+_echo_result $?
+
+echo -e "Enabling smartd autostart..."
+_enable_smartd_autostart "$OS"
+_echo_result $?
+
+echo -e "Sending data to FASTVPS monitoring server..."
+_run_script "$BIN_PATH" "$SCRIPT_NAME" "cron"
+_echo_result $?
+
+echo -e "Current storage status:"
+_run_script "$BIN_PATH" "$SCRIPT_NAME" "detect"
+echo
